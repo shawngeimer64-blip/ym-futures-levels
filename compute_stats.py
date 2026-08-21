@@ -29,7 +29,39 @@ import os
 from collections import defaultdict
 
 # ----- config -----
-FOLDER = os.path.dirname(os.path.abspath(__file__))
+# Read and write in the NT8 user folder, which is where YMLevelsLogger writes
+# ym_interactions.csv and where YMLevels reads ym_stats.csv back from. Resolving
+# these beside the script instead — as this originally did — means the stats run
+# finds no input and the indicator finds no stats, silently, on both ends.
+#
+# The helper is duplicated from ym_full_levels.py rather than imported so this
+# stays stdlib-only: computing stats over a CSV should not require yfinance,
+# numpy and scipy to be installed.
+def _nt8_user_dir():
+    env = os.environ.get("NT8_DIR")
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), "Documents", "NinjaTrader 8")
+
+
+def _resolve_folder():
+    """Prefer the NT8 user folder, but fall back to beside the script.
+
+    If you keep this script inside your ym_levels folder, the original
+    beside-the-script behaviour already worked — so don't break it. The NT8
+    location wins when it actually holds a log; otherwise a local
+    ym_interactions.csv is used.
+    """
+    nt8 = os.path.join(_nt8_user_dir(), "ym_levels")
+    here = os.path.dirname(os.path.abspath(__file__))
+    if os.path.exists(os.path.join(nt8, "ym_interactions.csv")):
+        return nt8
+    if os.path.exists(os.path.join(here, "ym_interactions.csv")):
+        return here
+    return nt8          # neither exists yet; report against the expected location
+
+
+FOLDER   = _resolve_folder()
 IN_PATH  = os.path.join(FOLDER, "ym_interactions.csv")
 OUT_PATH = os.path.join(FOLDER, "ym_stats.csv")
 
@@ -54,7 +86,10 @@ def touch_bucket(n):
 # ----- load + de-duplicate -----
 def load_rows(path):
     if not os.path.exists(path):
-        print(f"ERROR: {path} not found. Has the logger run yet?")
+        print(f"ERROR: {path} not found.")
+        print( "       That file is written by the YMLevelsLogger indicator, which only")
+        print( "       logs in real time — it does not back-process history. So it needs")
+        print( "       to have been on a live chart while price interacted with a level.")
         return []
 
     rows = []
