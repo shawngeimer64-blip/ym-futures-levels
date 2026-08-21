@@ -78,6 +78,17 @@ WALL_CONTEST_FRAC = 0.20
 USE_ATM_IV = True
 ATM_IV_STRIKES = 5      # median IV over this many strikes nearest spot, per side
 
+# Yahoo publishes 0.00001 as a PLACEHOLDER implied vol on contracts it has not
+# priced — which pre-market is roughly half the near-ATM chain. A median is
+# robust to a minority of outliers, not to a majority of placeholders: measured
+# 2026-08-21 at 09:09 ET, 52 of 108 near-spot quotes were 0.00001 and the median
+# came out at 0.00013, i.e. a 0.013% vol. Gamma is pdf(d1)/(S*sigma*sqrt(T)), so
+# a sigma that small makes d1 explode, pdf(d1) underflow, and gamma collapse to
+# zero on 51 of 62 strikes — producing confident-looking but meaningless walls.
+# Real index IV does not go below a few percent, so anything under this is a
+# placeholder and the contract is treated as unpriced.
+IV_MIN_PLAUSIBLE = 0.005
+
 # How many strikes to publish per side. Rank 1 is "Call Wall"/"Put Wall"; deeper
 # ranks are suffixed. A single argmax hides the fact that the top few strikes are
 # often near-tied, which is what made the printed wall look like it teleported.
@@ -244,7 +255,10 @@ def _atm_iv(chain, spot, lo, hi):
             if K < lo or K > hi:
                 continue
             iv = _num(r["impliedVolatility"])
-            if iv > 0:
+            # Placeholder vols must be excluded BEFORE the median, not trimmed
+            # after it — pre-market they are the majority, so they would carry
+            # the median rather than sit in its tail.
+            if iv >= IV_MIN_PLAUSIBLE:
                 rows.append((abs(K - spot), iv))
     if not rows:
         return None
@@ -274,7 +288,7 @@ def compute_gex(ref_spot_dia=None):
     """
     diag = {"strikes_in_band": 0, "contracts_with_oi": 0,
             "contracts_with_iv": 0, "total_oi": 0.0, "expiries_used": 0,
-            "atm_iv": {}}
+            "contracts_placeholder_iv": 0, "atm_iv": {}}
     dia = yf.Ticker("DIA")
     spot = float(dia.history(period="1d")["Close"].iloc[-1])
 
@@ -337,7 +351,12 @@ def compute_gex(ref_spot_dia=None):
                     diag["total_oi"] += oi
                 if iv > 0:
                     diag["contracts_with_iv"] += 1
-                if oi <= 0 or iv <= 0:
+                if 0 < iv < IV_MIN_PLAUSIBLE:
+                    diag["contracts_placeholder_iv"] += 1
+                # An unpriced contract contributes nothing but noise. Without
+                # this it contributes a gamma that has underflowed to zero,
+                # which silently removes the strike from wall contention.
+                if oi <= 0 or iv < IV_MIN_PLAUSIBLE:
                     continue
                 # Price off the expiry's ATM vol, not this contract's own, so a
                 # jittery per-strike quote cannot reorder the wall ranking. The
@@ -767,6 +786,35 @@ def main(refreeze=False):
               f"{abs(round((leader - rival) * dia_to_ym))} pts. Treat it as a zone.")
 
     # ---- Walls hold for the session; flip and regime stay live ----
+    # A book is only credible if a decent share of its strikes actually carry
+    # gamma. When implied vol is unpublished the gamma underflows to zero and the
+    # book collapses onto a handful of strikes, which still yields a wall — just
+    # a meaningless one. Measured on the bad 2026-08-21 pre-market run: 11 of 62
+    # strikes. A healthy RTH book had all 62.
+    strikes_with_gamma = sum(1 for v in gex_all.values() if v["call"] or v["put"])
+    book_ok = bool(gex_all) and strikes_with_gamma >= max(8, len(gex_all) // 3)
+    if gex_all and not book_ok:
+        print(f"\n  ! Gamma book looks degenerate: only {strikes_with_gamma} of "
+              f"{len(gex_all)} strikes carry any gamma.")
+        print( "    Implied vol is probably not published yet. Walls will NOT be pinned.")
+
+    # Never pin before the open. Pre-market the chain is not properly priced on
+    # EITHER input: open interest is absent overnight, and the implied vols that
+    # do appear are far too low — measured 2026-08-21 at 09:11 ET the ATM vols
+    # came out at 0.031 / 0.016 / 0.008 against 0.096-0.128 in the prior RTH
+    # session, with the term structure inverted. Those clear the placeholder
+    # floor but are not real vols, so a pre-market pin would fix a distorted
+    # reading in place for the entire day. Pre-market runs still publish live
+    # provisional walls; they just do not become the day's pin.
+    rth_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    in_rth = now_et >= rth_open
+    gamma_is_credible = book_ok and in_rth
+    if book_ok and not in_rth:
+        mins = int((rth_open - now_et).total_seconds() // 60)
+        print(f"\n  Pre-market: walls shown are PROVISIONAL and are not pinned "
+              f"({mins} min to the open).")
+        print( "    The chain is not fully priced yet. Re-run after 09:30 ET to set the day's walls.")
+
     day = today.isoformat()
     flip_levels = {k: v for k, v in gamma_levels.items() if "Flip" in k}
     wall_levels = {k: v for k, v in gamma_levels.items() if "Wall" in k}
@@ -790,15 +838,20 @@ def main(refreeze=False):
                   + "  ".join(f"{n} {lv} ({lv - hp:+d})" for n, hp, lv in sorted(drift)))
         else:
             print("    (the live book still agrees with every held level)")
-    elif wall_levels:
-        # Only ever freeze a reading that actually has gamma behind it. An
-        # overnight run returns no open interest and therefore no walls, and
-        # freezing that would pin an empty set for the whole day.
+    elif wall_levels and gamma_is_credible:
+        # Only ever pin a reading that actually has gamma behind it. Non-empty is
+        # NOT sufficient: pre-market, unpriced contracts still carry open
+        # interest, so walls get produced from a book where gamma has underflowed
+        # on nearly every strike. On 2026-08-21 that pinned a put wall one point
+        # below spot and a regime of POSITIVE, against NEGATIVE the day before.
+        # A pin is for the whole session, so it has to clear a real bar.
         f = save_frozen_walls(day, wall_levels, contested, ym_price, dia_spot)
         print(f"\n  Walls FROZEN for {day} at {f['frozen_at']} ET - {len(wall_levels)} levels.")
         print( "    Later runs today reuse these; flip and regime keep updating.")
-    else:
-        print("\n  No walls to freeze - no gamma data this run, so nothing was pinned.")
+    elif not wall_levels:
+        print("\n  No walls to pin - no gamma data this run.")
+    # The remaining case (walls exist but were not pinned, because the book is
+    # degenerate or it is still pre-market) has already explained itself above.
 
     gamma_levels = dict(flip_levels)
     gamma_levels.update(wall_levels)

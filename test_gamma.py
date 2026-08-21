@@ -133,5 +133,19 @@ check("yesterday's freeze is not reused", m.load_frozen_walls("2026-08-19"), Non
 m.save_frozen_walls("2026-08-21", {}, {}, 52854, 527.51)
 check("an empty freeze is refused", m.load_frozen_walls("2026-08-21"), None)
 
+print("\n10) Placeholder implied vols must be excluded BEFORE the median.")
+print("    Yahoo publishes 0.00001 on contracts it has not priced. Pre-market")
+print("    that is ~half the near-ATM chain, so a median over them lands on the")
+print("    placeholder itself and gamma underflows to zero across the board.")
+# Reproduces 2026-08-21 09:09 ET: half placeholders, half real.
+mixed_c = [{"strike": k, "impliedVolatility": 0.00001} for k in (527, 528, 529, 530)]
+mixed_p = [{"strike": k, "impliedVolatility": 0.11} for k in (527, 528, 529, 530)]
+iv = m._atm_iv(_Chain(mixed_c, mixed_p), 528.0, 500.0, 560.0)
+check("placeholders excluded, real vol survives", iv, 0.11)
+check("a chain of nothing but placeholders -> None",
+      m._atm_iv(_Chain(mixed_c, []), 528.0, 500.0, 560.0), None)
+check("the floor rejects 0.00001", 0.00001 >= m.IV_MIN_PLAUSIBLE, False)
+check("the floor accepts a real 0.11", 0.11 >= m.IV_MIN_PLAUSIBLE, True)
+
 print("\n" + ("ALL PASS" if not fails else "FAILURES: %s" % fails))
 sys.exit(1 if fails else 0)
