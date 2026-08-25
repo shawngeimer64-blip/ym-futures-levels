@@ -1,5 +1,5 @@
-// =====================================================================================
-//  YMLevels — Lines + Dashboard  (v11: live "APPROACHING" break/reject probabilities)
+﻿// =====================================================================================
+//  YMLevels — Lines + Dashboard  (v19: ★ = level break gated by 50 EMA slope only)
 // =====================================================================================
 
 #region Using declarations
@@ -84,7 +84,6 @@ namespace NinjaTrader.NinjaScript.Indicators
         private const int    ConfEmaPeriod  = 21;
         private const int    ConfEmaSlopeLB = 3;
         private const int    ConfAdxPeriod  = 14;
-        private const double ConfAdxStrong  = 20.0;
         private const int    ConfRsiPeriod  = 14;
 
         private double  rSpot;
@@ -145,16 +144,29 @@ namespace NinjaTrader.NinjaScript.Indicators
         private int    rSigDir;                 // 1 long / -1 short
         private string rSigType = "", rSigLevelName = "", rSigText = "";
         private double rSigLevelPrice, rSigStop, rSigTarget, rSigOddsPct;
+        private int    rSigConviction;      // 2 HIGH / 1 MED / 0 LOW (by level type)
+        private double rSigRR;              // reward:risk ratio (NaN if no target)
         private string lastSigKey = "";
         private int    lastSigBar = -1;
         private const double SignalStopBuffer = 12;   // YM pts beyond level for stop
+
+        // v16 — synthesized "what to do now" playbook line
+        private string rPlaybookText = "";
+        private int    rPlaybookSign;                 // 1 long / -1 short / 0 neutral
+
+        // v19 — break-with-trend star (replaces the odds/lean signal + trend-run triangles)
+        private const int ConfEma50Period = 50;
+        private Dictionary<string, int> lastBreakBar = new Dictionary<string, int>();
+        private int    rLastBreakBar = -1;
+        private string rLastBreakText = "";
+        private int    rLastBreakSign;
         #endregion
 
         #region WPF card fields
         private Grid      chartGrid;
         private Border    card, regimeRow, approachRow;
         private Grid      cardShell;
-        private Viewbox   contentBox;
+        private ScrollViewer contentScroll;
         private TextBlock tbTitle, tbSub, tbInstr, tbUpdated;
         private TextBlock tbRegime, tbBiasNum, tbBiasLabel, tbBiasBreak;
         private TextBlock tbApproachHdr, tbApproachStat;
@@ -166,7 +178,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private Border    signalRow;
         private TextBlock tbSignal;
         private TextBlock tbSpot, tbNearestUp, tbNearestDn;
-        private TextBlock tbRangeInfo;
+        private TextBlock tbRangeInfo, tbPlaybook;
         private Grid      rangeBarGrid;
         private System.Windows.Shapes.Rectangle rangeMarker;
         private StackPanel resPanel, supPanel, confPanel, gammaPanel;
@@ -216,7 +228,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (State == State.SetDefaults)
             {
-                Description = "YM levels from Python CSV: lines + dashboard with live approaching break/reject probabilities";
+                Description = "YM levels from Python CSV: lines + dashboard; ★ fires on a level break with the 50 EMA slope agreeing";
                 Name = "YMLevels";
                 Calculate = Calculate.OnEachTick;
                 IsOverlay = true;
@@ -227,8 +239,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                 IsSuspendedWhileInactive = false;
                 IsChartOnly = true;
 
+                // Globals.UserDataDir is NT8's own "Documents\NinjaTrader 8" and it
+                // resolves per-machine, so this needs no remapping on another box --
+                // unlike a hard-coded profile path, which is exactly how YMLevelsLogger
+                // ended up pointing at someone else's user folder.
                 string ymDir = System.IO.Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "ym_levels");
+                    NinjaTrader.Core.Globals.UserDataDir, "ym_levels");
                 CsvPath = System.IO.Path.Combine(ymDir, "ym_levels.csv");
                 StatsPath = System.IO.Path.Combine(ymDir, "ym_stats.csv");
                 RefreshSeconds = 30;
@@ -261,6 +277,15 @@ namespace NinjaTrader.NinjaScript.Indicators
                 SignalSoundFile = "Alert2.wav";
                 BreakSignalMinPct = 60;
                 FadeSignalMinPct = 55;
+                MinSignalConviction = 0;
+                AdxStrongThreshold = 28;   // moderate: was 20 — cuts chop stars
+                RsiUpBand = 55;
+                RsiOverbought = 70;        // above this = overextended, no confirm
+                RsiDownBand = 45;
+                RsiOversold = 30;          // below this = overextended, no confirm
+                SignalOffsetTicks = 8;
+                Ema50SlopeLookback = 3;
+                BreakCooldownBars  = 12;
 
                 UseCsvColors = false;
                 ResistanceColor = Brushes.Red;
@@ -327,7 +352,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             UpdateTouchCounts();
             ComputeConfirmation();
             RecomputeSnapshot();
-            HandleSignalOutput();
+            DetectLevelBreaks();
 
             if (ShowDashboard)
                 UpdateCard();
@@ -337,6 +362,13 @@ namespace NinjaTrader.NinjaScript.Indicators
         #region CSV loading
         private void LoadLevels()
         {
+            // Remember what is currently drawn. A refreshed CSV can DROP a level (a
+            // gamma wall that failed the sanity guard, an overnight level after the
+            // session rolls). Without this the old horizontal line stays on the chart
+            // forever at a stale price, which reads as a live level.
+            HashSet<string> priorNames = new HashSet<string>();
+            foreach (LevelInfo old in levels) priorNames.Add(old.Name);
+
             levels.Clear();
 
             if (!File.Exists(CsvPath))
@@ -401,11 +433,29 @@ namespace NinjaTrader.NinjaScript.Indicators
                     levels.Add(lv);
                 }
 
+                RemoveDroppedLines(priorNames);
                 Print("YMLevels: loaded " + levels.Count + " levels from CSV");
             }
             catch (Exception ex)
             {
                 Print("YMLevels: error reading CSV — " + ex.Message);
+            }
+        }
+
+        // Erase the chart line of any level that was present on the previous load but
+        // is gone from this one. Called after every successful reload.
+        private void RemoveDroppedLines(HashSet<string> priorNames)
+        {
+            if (priorNames == null || priorNames.Count == 0) return;
+            if (State != State.Historical && State != State.Realtime) return;
+
+            HashSet<string> current = new HashSet<string>();
+            foreach (LevelInfo lv in levels) current.Add(lv.Name);
+
+            foreach (string name in priorNames)
+            {
+                if (current.Contains(name)) continue;
+                try { RemoveDrawObject("YMLev_" + name); } catch { }
             }
         }
 
@@ -515,9 +565,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         // v14 — internal trend/momentum read, combined with zone bias into one
-        // overall lean (1 long / -1 short / 0 none). Confirmation only fires when
-        // trend is strong (ADX) and trend+momentum agree; zone structure then
-        // reinforces or offsets it.
+        // overall lean (1 long / -1 short / 0 none). NOTE (v19): this now feeds the
+        // dashboard "Lean" box ONLY — it no longer gates the ★ entry star.
         private void ComputeConfirmation()
         {
             if (CurrentBar < ConfEmaPeriod + ConfEmaSlopeLB + 2)
@@ -533,10 +582,16 @@ namespace NinjaTrader.NinjaScript.Indicators
                 rTrendDir = ema > emaPrev ? 1 : (ema < emaPrev ? -1 : 0);
 
                 rAdxVal    = ADX(ConfAdxPeriod)[0];
-                rAdxStrong = rAdxVal >= ConfAdxStrong;
+                rAdxStrong = rAdxVal >= AdxStrongThreshold;
 
                 rRsiVal = RSI(ConfRsiPeriod, 3)[0];
-                rMomDir = rRsiVal > 55 ? 1 : (rRsiVal < 45 ? -1 : 0);
+                // v18 — momentum counts as UP only when RSI is rising but NOT
+                // overextended (between the up-band and the overbought cap), and
+                // DOWN only between the oversold cap and the down-band. Beyond the
+                // caps = overextended = no confirmation (kills buy-the-top stars).
+                if (rRsiVal >= RsiUpBand && rRsiVal <= RsiOverbought)      rMomDir =  1;
+                else if (rRsiVal <= RsiDownBand && rRsiVal >= RsiOversold) rMomDir = -1;
+                else                                                       rMomDir =  0;
 
                 if (rAdxStrong && rTrendDir > 0 && rMomDir > 0)      rLeanInternal =  1;
                 else if (rAdxStrong && rTrendDir < 0 && rMomDir < 0) rLeanInternal = -1;
@@ -995,6 +1050,9 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         // Finds the nearest level within ApproachDistance and looks up its historical stat.
+        // v19 — this box is now REFERENCE-ONLY. It still shows the odds/confirm context
+        // as price nears a level, but it no longer fires the ★ entry star. The star is
+        // owned entirely by DetectLevelBreaks() (break + 50 EMA slope).
         private void ComputeApproach()
         {
             rApHaveOdds = false; rApTrustOdds = false;
@@ -1011,6 +1069,11 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (near == null)
             {
                 rApproachActive = false;
+                rSigActive = false;
+                if (rLastBreakBar >= 0 && (CurrentBar - rLastBreakBar) <= BreakCooldownBars)
+                { rPlaybookText = rLastBreakText; rPlaybookSign = rLastBreakSign; }
+                else
+                { rPlaybookText = "WAIT — no level within " + ApproachDistance + " pts"; rPlaybookSign = 0; }
                 return;
             }
 
@@ -1073,89 +1136,80 @@ namespace NinjaTrader.NinjaScript.Indicators
             else                                { rApproachConfirm = "✗ favors break";            rApproachConfirmSign = -1; }
 
             rApproachActive = true;
+            rSigActive = false;   // v19 — stars now come from DetectLevelBreaks, not odds/lean
 
-            // v15 — entry signal: odds pick fade vs break; require trustworthy odds
-            // AND the combined lean pointing the same way as that trade.
-            if (EnableSignals && rApHaveOdds && rApTrustOdds && rLeanOverall != 0)
+            // v19 — PLAYBOOK: show the most recent break for a short window, otherwise
+            // a neutral "near a level, waiting for a close-through" line.
+            string lvlTxt = PrettyName(near.Name) + " " + near.Price.ToString("0");
+            if (rLastBreakBar >= 0 && (CurrentBar - rLastBreakBar) <= BreakCooldownBars)
             {
-                int breakDir = -bounceDir;   // break of support = short; break of resistance = long
-                if (rApBreakPct >= BreakSignalMinPct && rLeanOverall == breakDir)
-                {
-                    rSigActive = true; rSigDir = breakDir; rSigType = "BREAK"; rSigOddsPct = rApBreakPct;
-                }
-                else if (rApRejectPct >= FadeSignalMinPct && rLeanOverall == bounceDir)
-                {
-                    rSigActive = true; rSigDir = bounceDir; rSigType = "FADE"; rSigOddsPct = rApRejectPct;
-                }
-
-                if (rSigActive)
-                {
-                    rSigLevelName  = PrettyName(near.Name);
-                    rSigLevelPrice = near.Price;
-                    rSigStop   = rSigDir > 0 ? near.Price - SignalStopBuffer : near.Price + SignalStopBuffer;
-                    rSigTarget = FindTarget(rSigDir, near.Price);
-
-                    string dirTxt = rSigDir > 0 ? "▲ LONG " : "▼ SHORT ";
-                    string tgtTxt = double.IsNaN(rSigTarget) ? "" : " · tgt " + rSigTarget.ToString("0");
-                    rSigText = dirTxt + rSigType + " @ " + rSigLevelName + " " + rSigLevelPrice.ToString("0")
-                             + " · stop " + rSigStop.ToString("0") + tgtTxt
-                             + " · edge " + rSigOddsPct.ToString("0") + "%";
-                }
+                rPlaybookText = rLastBreakText;
+                rPlaybookSign = rLastBreakSign;
+            }
+            else
+            {
+                rPlaybookText = "NEAR " + lvlTxt + " — waiting for a close-through with the 50 EMA";
+                rPlaybookSign = 0;
             }
         }
 
-        // v15 — nearest level in the trade direction to use as a target (NaN if none)
-        private double FindTarget(int dir, double excludePrice)
+        // v19 — the ONLY entry star. Fires on a close-through of any level, gated
+        // solely by the 50 EMA slope. Break up + 50 EMA rising = LONG (lime star
+        // below the bar); break down + 50 EMA falling = SHORT (red star above).
+        // No odds, no ADX/RSI/lean, no fade — pure break-with-trend.
+        private void DetectLevelBreaks()
         {
-            double best = double.NaN;
+            if (!EnableSignals || levels.Count == 0) return;
+            if (CurrentBar < ConfEma50Period + Ema50SlopeLookback + 1) return;
+            if (!IsFirstTickOfBar) return;   // evaluate once, on the bar that just closed
+
+            double ema0 = EMA(ConfEma50Period)[1];                       // just-closed bar
+            double emaN = EMA(ConfEma50Period)[1 + Ema50SlopeLookback];  // N bars before it
+            int emaDir = ema0 > emaN ? 1 : (ema0 < emaN ? -1 : 0);
+            if (emaDir == 0) return;         // flat 50 EMA → no star
+
+            double cPrev = Close[2];         // bar before the one that just closed
+            double cNow  = Close[1];         // the bar that just closed
+
             foreach (LevelInfo lv in levels)
             {
-                if (Math.Abs(lv.Price - excludePrice) < 1) continue;
-                if (dir > 0 && lv.Price > rSpot)
-                { if (double.IsNaN(best) || lv.Price < best) best = lv.Price; }
-                else if (dir < 0 && lv.Price < rSpot)
-                { if (double.IsNaN(best) || lv.Price > best) best = lv.Price; }
-            }
-            return best;
-        }
+                bool brokeUp   = cPrev <= lv.Price && cNow > lv.Price;
+                bool brokeDown = cPrev >= lv.Price && cNow < lv.Price;
+                if (!brokeUp && !brokeDown) continue;
 
-        // v15 — draw the chart arrow and fire the sound alert once per new signal.
-        // Fires once when a signal appears; re-arms after the signal clears.
-        private void HandleSignalOutput()
-        {
-            if (!EnableSignals || !rSigActive)
-            {
-                lastSigKey = "";
-                return;
-            }
+                int dir = brokeUp ? 1 : -1;
+                if (dir != emaDir) continue; // 50 EMA slope must agree with the break
 
-            string key = rSigType + "|" + rSigDir + "|" + rSigLevelName;
-            if (key == lastSigKey) return;   // already fired for this signal
-            lastSigKey = key;
-            lastSigBar = CurrentBar;
+                string key = lv.Name + (dir > 0 ? "U" : "D");
+                int lb;
+                if (lastBreakBar.TryGetValue(key, out lb) && (CurrentBar - lb) < BreakCooldownBars) continue;
+                lastBreakBar[key] = CurrentBar;
 
-            try
-            {
-                string tag = "YMSig_" + CurrentBar + "_" + (rSigDir > 0 ? "U" : "D");
-                if (rSigDir > 0)
-                    NinjaTrader.NinjaScript.DrawingTools.Draw.ArrowUp(
-                        this, tag, false, 0, Low[0] - 2 * TickSize, Brushes.Lime);
+                string tag = "YMBrk_" + CurrentBar + "_" + key;
+                if (dir > 0)
+                    NinjaTrader.NinjaScript.DrawingTools.Draw.Text(
+                        this, tag, "★", 1, Low[1] - SignalOffsetTicks * TickSize, Brushes.Lime);
                 else
-                    NinjaTrader.NinjaScript.DrawingTools.Draw.ArrowDown(
-                        this, tag, false, 0, High[0] + 2 * TickSize, Brushes.Red);
-            }
-            catch { }
+                    NinjaTrader.NinjaScript.DrawingTools.Draw.Text(
+                        this, tag, "★", 1, High[1] + SignalOffsetTicks * TickSize, Brushes.Red);
 
-            if (State == State.Realtime)
-            {
-                try
+                rLastBreakBar  = CurrentBar;
+                rLastBreakSign = dir;
+                rLastBreakText = (dir > 0 ? "▲ LONG" : "▼ SHORT") + " break of "
+                               + PrettyName(lv.Name) + " " + lv.Price.ToString("0")
+                               + " · 50 EMA " + (emaDir > 0 ? "rising" : "falling");
+
+                if (State == State.Realtime)
                 {
-                    string snd = string.IsNullOrEmpty(SignalSoundFile)
-                        ? "" : NinjaTrader.Core.Globals.InstallDir + @"\sounds\" + SignalSoundFile;
-                    Alert("YMSig", NinjaTrader.NinjaScript.Priority.High, rSigText, snd, 0,
-                          Brushes.Black, rSigDir > 0 ? Brushes.Lime : Brushes.Red);
+                    try
+                    {
+                        string snd = string.IsNullOrEmpty(SignalSoundFile)
+                            ? "" : NinjaTrader.Core.Globals.InstallDir + @"\sounds\" + SignalSoundFile;
+                        Alert("YMBrk" + key, NinjaTrader.NinjaScript.Priority.High, rLastBreakText, snd, 0,
+                              Brushes.Black, dir > 0 ? Brushes.Lime : Brushes.Red);
+                    }
+                    catch { }
                 }
-                catch { }
             }
         }
         #endregion
@@ -1293,7 +1347,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             };
             stack.Children.Add(approachRow);
 
-            // v15 — ENTRY SIGNAL box (hidden until a signal fires)
+            // v15 — ENTRY SIGNAL box. v19: no longer driven (the star lives on the
+            // chart + the PLAYBOOK line). Kept in the tree, stays collapsed.
             tbSignal = new TextBlock
             {
                 Text = "", Foreground = Brushes.White, FontFamily = fam,
@@ -1345,7 +1400,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             };
             stack.Children.Add(outlookRow);
 
-            // v14 — CONFIRMATION box: overall lean + reads + zone note
+            // v14 — CONFIRMATION box: overall lean + reads + zone note (reference only)
             tbConfirmVerdict = new TextBlock
             {
                 Text = "", Foreground = RowText, FontFamily = fam,
@@ -1383,6 +1438,47 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Child = cfStack
             };
             stack.Children.Add(confirmRow);
+
+            // v16 — PLAYBOOK box (styled like the boxes above; sits under Lean)
+            if (ShowNearestSection)
+            {
+                TextBlock pbHdr = new TextBlock
+                {
+                    Text = "PLAYBOOK", Foreground = TextDim, FontFamily = fam,
+                    FontSize = 10, FontWeight = FontWeights.SemiBold,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    Margin = new Thickness(0, 0, 0, 2)
+                };
+                tbSpot = new TextBlock
+                {
+                    Text = "YM —", Foreground = Brushes.White, FontFamily = fam,
+                    FontSize = 11, FontWeight = FontWeights.Bold,
+                    HorizontalAlignment = HorizontalAlignment.Center
+                };
+                tbPlaybook = new TextBlock
+                {
+                    Text = "", Foreground = RowText, FontFamily = fam,
+                    FontSize = 12, FontWeight = FontWeights.Bold,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    TextAlignment = System.Windows.TextAlignment.Center,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 2, 0, 0)
+                };
+                StackPanel pbStack = new StackPanel();
+                pbStack.Children.Add(pbHdr);
+                pbStack.Children.Add(tbSpot);
+                pbStack.Children.Add(tbPlaybook);
+                Border playbookRow = new Border
+                {
+                    Background = RowFill, BorderBrush = RowBorder,
+                    BorderThickness = new Thickness(1.4),
+                    CornerRadius = new CornerRadius(6),
+                    Padding = new Thickness(6, 5, 6, 5),
+                    Margin = new Thickness(0, 6, 0, 2),
+                    Child = pbStack
+                };
+                stack.Children.Add(playbookRow);
+            }
 
             Grid biasHdr = new Grid { Margin = new Thickness(0, 8, 0, 2) };
             biasHdr.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -1441,30 +1537,6 @@ namespace NinjaTrader.NinjaScript.Indicators
             };
             stack.Children.Add(tbBiasBreak);
 
-            if (ShowNearestSection)
-            {
-                stack.Children.Add(SectionHeader(fam, "Position"));
-                tbSpot = MakeRowText(fam, "YM —");
-                tbSpot.FontWeight = FontWeights.Bold;
-                stack.Children.Add(tbSpot);
-
-                tbRangeInfo = MakeRowText(fam, "");
-                stack.Children.Add(tbRangeInfo);
-
-                // mini day-range bar with a position marker
-                rangeBarGrid = new Grid { Height = 8, Margin = new Thickness(0, 3, 0, 2) };
-                rangeBarGrid.Children.Add(new System.Windows.Shapes.Rectangle
-                {
-                    Fill = BarTrack, RadiusX = 3, RadiusY = 3
-                });
-                rangeMarker = new System.Windows.Shapes.Rectangle
-                {
-                    Fill = Brushes.White, Width = 3, RadiusX = 1, RadiusY = 1,
-                    HorizontalAlignment = HorizontalAlignment.Left
-                };
-                rangeBarGrid.Children.Add(rangeMarker);
-                stack.Children.Add(rangeBarGrid);
-            }
             if (ShowResSupSection)
             {
                 tbResHdr = SectionHeader(fam, "Resistance Above");
@@ -1492,17 +1564,18 @@ namespace NinjaTrader.NinjaScript.Indicators
                 stack.Children.Add(gammaPanel);
             }
 
-            contentBox = new Viewbox
+            contentScroll = new ScrollViewer
             {
-                Child = stack,
-                Stretch = System.Windows.Media.Stretch.Uniform,
-                StretchDirection = System.Windows.Controls.StretchDirection.Both,
+                Content = stack,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
                 HorizontalAlignment = HorizontalAlignment.Stretch,
-                VerticalAlignment   = VerticalAlignment.Stretch
+                VerticalAlignment   = VerticalAlignment.Stretch,
+                Padding = new Thickness(0, 0, 4, 0)
             };
 
             cardShell = new Grid();
-            cardShell.Children.Add(contentBox);
+            cardShell.Children.Add(contentScroll);
 
             gripNW = MakeGrip(Cursors.SizeNWSE);
             gripNW.HorizontalAlignment = HorizontalAlignment.Left;
@@ -1787,7 +1860,6 @@ namespace NinjaTrader.NinjaScript.Indicators
             DateTime upDt = csvUpdatedDt;
 
             // v13 locals
-            double dHigh = rDayHigh, dLow = rDayLow, rangePct = rRangePct;
             List<ConfInfo> confOdds = new List<ConfInfo>(rConfOdds);
 
             // v14 locals
@@ -1799,10 +1871,14 @@ namespace NinjaTrader.NinjaScript.Indicators
             string apConfirm = rApproachConfirm;
             int    apConfirmSign = rApproachConfirmSign;
 
-            // v15 signal locals
+            // v15 signal locals (v19: signal box stays hidden)
             bool   sigActive = rSigActive;
             string sigText = rSigText;
             int    sigDir = rSigDir;
+
+            // v16 playbook locals
+            string playbookText = rPlaybookText;
+            int    playbookSign = rPlaybookSign;
 
             try
             {
@@ -1858,7 +1934,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                             approachRow.Visibility = Visibility.Collapsed;
                         }
 
-                        // v15 — ENTRY SIGNAL box
+                        // v15 — ENTRY SIGNAL box (v19: no longer driven, stays hidden)
                         if (signalRow != null)
                         {
                             if (sigActive)
@@ -1876,7 +1952,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                             }
                         }
 
-                        // v14 — CONFIRMATION box (always visible)
+                        // v14 — CONFIRMATION box (always visible, reference only)
                         if (confirmRow != null)
                         {
                             string verdict = leanOverall > 0 ? "Lean: LONG"
@@ -1909,25 +1985,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                             tbSpot.Foreground = Brushes.White;
                             tbSpot.FontWeight = FontWeights.Bold;
 
-                            if (!double.IsNaN(rangePct) && !double.IsNaN(dHigh) && !double.IsNaN(dLow))
-                            {
-                                int pct = (int)Math.Round(rangePct * 100);
-                                string zone = rangePct >= 0.66 ? "upper" : (rangePct <= 0.34 ? "lower" : "middle");
-                                tbRangeInfo.Text = "Day " + dLow.ToString("0") + "–" + dHigh.ToString("0")
-                                                 + " · " + pct + "% (" + zone + ")";
-                                tbRangeInfo.Foreground = rangePct >= 0.66 ? BullBrush
-                                                       : (rangePct <= 0.34 ? BearBrush : RowText);
-
-                                double bw = rangeBarGrid.ActualWidth;
-                                if (bw < 1) bw = Math.Max(180, CardWidth - 28);
-                                double x = (bw - 3) * rangePct;
-                                rangeMarker.Margin = new Thickness(Math.Max(0, x), 0, 0, 0);
-                            }
-                            else
-                            {
-                                tbRangeInfo.Text = "Day range: building…";
-                                tbRangeInfo.Foreground = TextDim;
-                            }
+                            tbPlaybook.Text = playbookText;
+                            tbPlaybook.Foreground = playbookSign > 0 ? BullBrush
+                                                  : (playbookSign < 0 ? BearBrush : RowText);
                         }
 
                         if (ShowResSupSection)
@@ -2086,6 +2146,18 @@ namespace NinjaTrader.NinjaScript.Indicators
         #endregion
 
         #region Properties
+        // A Brush picked in the property grid arrives UNFROZEN and owned by the UI
+        // thread. These brushes are handed to Draw.HorizontalLine from the data
+        // thread and read as SolidColorBrush.Color from the render thread, both of
+        // which throw on a cross-thread WPF object. Freezing on set makes them
+        // thread-safe. (The Brushes.* defaults are already frozen; only a
+        // user-picked colour hit this.)
+        private static Brush Freeze(Brush b)
+        {
+            if (b != null && b.CanFreeze && !b.IsFrozen) b.Freeze();
+            return b;
+        }
+
         [NinjaScriptProperty]
         [Display(Name = "CSV Path", Order = 1, GroupName = "1. Data")]
         public string CsvPath { get; set; }
@@ -2187,13 +2259,53 @@ namespace NinjaTrader.NinjaScript.Indicators
         [Display(Name = "Signal Sound File", Order = 2, GroupName = "6. Signals")]
         public string SignalSoundFile { get; set; }
 
+        // v19 — the following BreakSignalMinPct / FadeSignalMinPct / MinSignalConviction
+        // / AdxStrongThreshold / RSI-band inputs are no longer used by the ★ star (the
+        // star is break + 50 EMA slope only). They still drive the dashboard "Lean"
+        // box reads. Left in place; safe to delete once you're happy with v19.
         [Range(50, 100)]
-        [Display(Name = "Break Signal Min %", Order = 3, GroupName = "6. Signals")]
+        [Display(Name = "Break Signal Min % (legacy, unused by ★)", Order = 3, GroupName = "6. Signals")]
         public int BreakSignalMinPct { get; set; }
 
         [Range(50, 100)]
-        [Display(Name = "Fade Signal Min %", Order = 4, GroupName = "6. Signals")]
+        [Display(Name = "Fade Signal Min % (legacy, unused by ★)", Order = 4, GroupName = "6. Signals")]
         public int FadeSignalMinPct { get; set; }
+
+        [Range(0, 100)]
+        [Display(Name = "Signal Offset (ticks from bar)", Order = 5, GroupName = "6. Signals")]
+        public int SignalOffsetTicks { get; set; }
+
+        [Range(0, 2)]
+        [Display(Name = "Min Signal Conviction (legacy, unused by ★)", Order = 6, GroupName = "6. Signals")]
+        public int MinSignalConviction { get; set; }
+
+        [Range(0, 100)]
+        [Display(Name = "ADX Strong Threshold (Lean box only)", Order = 7, GroupName = "6. Signals")]
+        public double AdxStrongThreshold { get; set; }
+
+        [Range(50, 100)]
+        [Display(Name = "RSI Up Band (Lean box only)", Order = 8, GroupName = "6. Signals")]
+        public double RsiUpBand { get; set; }
+
+        [Range(50, 100)]
+        [Display(Name = "RSI Overbought Cap (Lean box only)", Order = 9, GroupName = "6. Signals")]
+        public double RsiOverbought { get; set; }
+
+        [Range(0, 50)]
+        [Display(Name = "RSI Down Band (Lean box only)", Order = 10, GroupName = "6. Signals")]
+        public double RsiDownBand { get; set; }
+
+        [Range(0, 50)]
+        [Display(Name = "RSI Oversold Cap (Lean box only)", Order = 11, GroupName = "6. Signals")]
+        public double RsiOversold { get; set; }
+
+        [Range(1, 20)]
+        [Display(Name = "50 EMA Slope Lookback (bars)", Order = 12, GroupName = "6. Signals")]
+        public int Ema50SlopeLookback { get; set; }
+
+        [Range(1, 200)]
+        [Display(Name = "Break Cooldown (bars per level/side)", Order = 13, GroupName = "6. Signals")]
+        public int BreakCooldownBars { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Use CSV Colors (override below)", Order = 1, GroupName = "5. Colors")]
@@ -2201,55 +2313,73 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         [NinjaScriptProperty] [XmlIgnore]
         [Display(Name = "Resistance (R1/R2/R3)", Order = 2, GroupName = "5. Colors")]
-        public Brush ResistanceColor { get; set; }
+        public Brush ResistanceColor
+        { get { return _resistanceColor; } set { _resistanceColor = Freeze(value); } }
+        private Brush _resistanceColor;
         [Browsable(false)] public string ResistanceColorSerialize
         { get { return Serialize.BrushToString(ResistanceColor); } set { ResistanceColor = Serialize.StringToBrush(value); } }
 
         [NinjaScriptProperty] [XmlIgnore]
         [Display(Name = "Support (S1/S2/S3)", Order = 3, GroupName = "5. Colors")]
-        public Brush SupportColor { get; set; }
+        public Brush SupportColor
+        { get { return _supportColor; } set { _supportColor = Freeze(value); } }
+        private Brush _supportColor;
         [Browsable(false)] public string SupportColorSerialize
         { get { return Serialize.BrushToString(SupportColor); } set { SupportColor = Serialize.StringToBrush(value); } }
 
         [NinjaScriptProperty] [XmlIgnore]
         [Display(Name = "Pivot (Pivot/Y-Mid)", Order = 4, GroupName = "5. Colors")]
-        public Brush PivotColor { get; set; }
+        public Brush PivotColor
+        { get { return _pivotColor; } set { _pivotColor = Freeze(value); } }
+        private Brush _pivotColor;
         [Browsable(false)] public string PivotColorSerialize
         { get { return Serialize.BrushToString(PivotColor); } set { PivotColor = Serialize.StringToBrush(value); } }
 
         [NinjaScriptProperty] [XmlIgnore]
         [Display(Name = "Overnight (ONH/ONM/ONL)", Order = 5, GroupName = "5. Colors")]
-        public Brush OvernightColor { get; set; }
+        public Brush OvernightColor
+        { get { return _overnightColor; } set { _overnightColor = Freeze(value); } }
+        private Brush _overnightColor;
         [Browsable(false)] public string OvernightColorSerialize
         { get { return Serialize.BrushToString(OvernightColor); } set { OvernightColor = Serialize.StringToBrush(value); } }
 
         [NinjaScriptProperty] [XmlIgnore]
         [Display(Name = "Prior Week", Order = 6, GroupName = "5. Colors")]
-        public Brush PriorWeekColor { get; set; }
+        public Brush PriorWeekColor
+        { get { return _priorWeekColor; } set { _priorWeekColor = Freeze(value); } }
+        private Brush _priorWeekColor;
         [Browsable(false)] public string PriorWeekColorSerialize
         { get { return Serialize.BrushToString(PriorWeekColor); } set { PriorWeekColor = Serialize.StringToBrush(value); } }
 
         [NinjaScriptProperty] [XmlIgnore]
         [Display(Name = "Prior Month", Order = 7, GroupName = "5. Colors")]
-        public Brush PriorMonthColor { get; set; }
+        public Brush PriorMonthColor
+        { get { return _priorMonthColor; } set { _priorMonthColor = Freeze(value); } }
+        private Brush _priorMonthColor;
         [Browsable(false)] public string PriorMonthColorSerialize
         { get { return Serialize.BrushToString(PriorMonthColor); } set { PriorMonthColor = Serialize.StringToBrush(value); } }
 
         [NinjaScriptProperty] [XmlIgnore]
         [Display(Name = "Gamma Flip", Order = 8, GroupName = "5. Colors")]
-        public Brush GammaFlipColor { get; set; }
+        public Brush GammaFlipColor
+        { get { return _gammaFlipColor; } set { _gammaFlipColor = Freeze(value); } }
+        private Brush _gammaFlipColor;
         [Browsable(false)] public string GammaFlipColorSerialize
         { get { return Serialize.BrushToString(GammaFlipColor); } set { GammaFlipColor = Serialize.StringToBrush(value); } }
 
         [NinjaScriptProperty] [XmlIgnore]
         [Display(Name = "Call Wall", Order = 9, GroupName = "5. Colors")]
-        public Brush CallWallColor { get; set; }
+        public Brush CallWallColor
+        { get { return _callWallColor; } set { _callWallColor = Freeze(value); } }
+        private Brush _callWallColor;
         [Browsable(false)] public string CallWallColorSerialize
         { get { return Serialize.BrushToString(CallWallColor); } set { CallWallColor = Serialize.StringToBrush(value); } }
 
         [NinjaScriptProperty] [XmlIgnore]
         [Display(Name = "Put Wall", Order = 10, GroupName = "5. Colors")]
-        public Brush PutWallColor { get; set; }
+        public Brush PutWallColor
+        { get { return _putWallColor; } set { _putWallColor = Freeze(value); } }
+        private Brush _putWallColor;
         [Browsable(false)] public string PutWallColorSerialize
         { get { return Serialize.BrushToString(PutWallColor); } set { PutWallColor = Serialize.StringToBrush(value); } }
         #endregion

@@ -95,8 +95,15 @@ namespace NinjaTrader.NinjaScript.Indicators
                 PaintPriceMarkers = false;
                 IsSuspendedWhileInactive = false;
 
-                CsvPath = @"C:\Users\shawn\Documents\ym_levels\ym_levels.csv";
-                LogPath = @"C:\Users\shawn\Documents\ym_levels\ym_interactions.csv";
+                // Globals.UserDataDir is NT8's own "Documents\NinjaTrader 8", resolved
+                // per-machine, so this needs no remapping on another box. These were
+                // hard-coded to another user's profile, so the CSV never existed here
+                // and the logger silently logged nothing. Must stay in step with
+                // YMLevels.CsvPath and with the folder ym_full_levels.py writes to.
+                string ymDir = System.IO.Path.Combine(
+                    NinjaTrader.Core.Globals.UserDataDir, "ym_levels");
+                CsvPath = System.IO.Path.Combine(ymDir, "ym_levels.csv");
+                LogPath = System.IO.Path.Combine(ymDir, "ym_interactions.csv");
 
                 TouchTolerance = 3;
                 BreakPoints    = 15;
@@ -287,6 +294,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             try
             {
+                // The log lives beside ym_levels.csv; on a fresh machine that folder may
+                // not exist yet, and StreamWriter throws rather than creating it.
+                string dir = Path.GetDirectoryName(LogPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
                 if (!File.Exists(LogPath))
                 {
                     using (var sw = new StreamWriter(LogPath, false))

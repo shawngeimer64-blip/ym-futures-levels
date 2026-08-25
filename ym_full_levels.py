@@ -28,8 +28,12 @@ FIXES IN THIS VERSION
    are written to the CSV for the dashboard + logger.
 """
 
+import argparse
 import requests
 import csv
+import glob
+import json
+import math
 import os
 import yfinance as yf
 import numpy as np
@@ -48,11 +52,88 @@ RISK_FREE = 0.043
 CONTRACT_SIZE = 100
 CONFLUENCE_TOL = 50
 MAX_DTE = 60                 # ignore expiries further out than this
-GAMMA_SANITY_PTS = 1500      # gamma level farther than this (YM pts) from the
+GAMMA_SANITY_FRAC = 0.03     # gamma level farther than this fraction of the
                              # FUTURES spot is treated as bad data and dropped
 STRIKE_BAND = 0.05           # only use option strikes within +/-5% of spot
 SPOT_DISAGREE_FRAC = 0.10    # if DIA history close differs from the futures
                              # reference by more than this, trust the futures
+
+# 252 trading days x 6.5h RTH = 1638 option-trading hours per year. Used to price
+# 0DTE by the session time actually left instead of pretending it has a full day.
+TRADING_HOURS_PER_YEAR = 1638.0
+
+# A wall is an argmax over strikes. If the runner-up carries at least this share
+# of the leader's gamma, the two swap places on noise and the printed level jumps
+# between them, so the wall is reported as contested.
+WALL_CONTEST_FRAC = 0.20
+
+# Price every strike in an expiry off ONE implied vol instead of each contract's
+# own. yfinance's per-contract IV is a derived, delayed field that jitters strike
+# to strike between polls, and that jitter was the only thing that could move the
+# wall intraday: gamma = OI x BS_gamma(spot, K, T, IV), OI is fixed for the day,
+# and 17 live cycles showed the same spot producing different walls, so spot was
+# ruled out. One smooth IV per expiry leaves the ranking driven by OI and spot.
+# Cost: the volatility smile is discarded, which slightly misprices far-OTM
+# gamma. That is a fair trade when what matters is the RELATIVE ranking near the
+# money. Set False to go back to per-contract IV.
+USE_ATM_IV = True
+ATM_IV_STRIKES = 5      # median IV over this many strikes nearest spot, per side
+
+# Yahoo publishes 0.00001 as a PLACEHOLDER implied vol on contracts it has not
+# priced — which pre-market is roughly half the near-ATM chain. A median is
+# robust to a minority of outliers, not to a majority of placeholders: measured
+# 2026-08-21 at 09:09 ET, 52 of 108 near-spot quotes were 0.00001 and the median
+# came out at 0.00013, i.e. a 0.013% vol. Gamma is pdf(d1)/(S*sigma*sqrt(T)), so
+# a sigma that small makes d1 explode, pdf(d1) underflow, and gamma collapse to
+# zero on 51 of 62 strikes — producing confident-looking but meaningless walls.
+# Real index IV does not go below a few percent, so anything under this is a
+# placeholder and the contract is treated as unpriced.
+IV_MIN_PLAUSIBLE = 0.005
+
+# Separate, higher bar for PINNING the day's walls. IV_MIN_PLAUSIBLE only rejects
+# Yahoo's 0.00001 placeholder; it does not reject a chain that simply has not
+# repriced yet. Measured: pre-open ATM vols come out at 0.008-0.031, RTH at
+# 0.096-0.129 -- a clean gap. A clock-only gate pinned at 09:30:08 on 2026-08-25,
+# eight seconds after the bell, when the feed was still serving the pre-open
+# chain. A pin lasts the whole session, so it has to wait for real data rather
+# than for a particular second.
+ATM_IV_MIN_FOR_PIN = 0.05
+
+# How many strikes to publish per side. Rank 1 is "Call Wall"/"Put Wall"; deeper
+# ranks are suffixed. A single argmax hides the fact that the top few strikes are
+# often near-tied, which is what made the printed wall look like it teleported.
+# Set to 1 after live evidence. Publishing ranks 2-3 as ordinary Gamma rows made
+# them real drawn levels, which the STRATEGY's room filter then measures against
+# -- not just the star and LevelBreak mode as first assumed. Densifying the level
+# set left less clear space, and with SRMinRoomTicks=25 that cost entries: on
+# 2026-08-25, "Put Wall 2/3" and "Call Wall 2/3" accounted for 7 of 26 named
+# room blocks. The ladder's job was diagnostic -- showing that walls are often
+# near-tied -- and it did that; the contested warning and the *Rival meta rows
+# still report it without turning it into a level that blocks trades.
+# Raise this again only for analysis, not for a live chart.
+WALL_LADDER_DEPTH = 1
+
+# How many ranks to RECORD, as distinct from how many to publish as levels.
+# Depth 1 stops ranks 2-3 gating trades, but it also stopped them being written
+# down at all -- and the open question "was dropping the ladder good or bad?"
+# cannot be answered without knowing where those ranks WERE at each signal time.
+# Ranks 2+ are therefore still computed and stored, as Meta rows. Every
+# NinjaScript reader skips Type == "Meta", so they inform the analysis without
+# ever becoming a level the room filter measures against.
+WALL_LADDER_RECORD_DEPTH = 3
+
+# Where the NinjaTrader side looks. YMLevels, YMLevelsLogger and any strategy
+# reading the same file resolve it from NinjaTrader.Core.Globals.UserDataDir, which is
+# NT8's own "Documents\NinjaTrader 8". Keeping the levels inside the NT8 user
+# folder means neither side hard-codes a profile path, so the whole thing moves to
+# another machine untouched. NT8_DIR overrides, matching nt8bridge.
+def _nt8_user_dir():
+    env = os.environ.get("NT8_DIR")
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), "Documents", "NinjaTrader 8")
+
+OUTPUT_DIR = os.path.join(_nt8_user_dir(), "ym_levels")
 
 # ==========================================================
 #   PART 1 — SESSION LEVELS FROM YM FUTURES
@@ -150,14 +231,92 @@ def bs_gamma(S, K, T, r, sigma):
     d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
     return norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
+def _num(v, default=0.0):
+    """Coerce a yfinance cell to a real number.
+
+    yfinance routinely returns NaN for openInterest / impliedVolatility on thin
+    strikes. The old code did `row["openInterest"] or 0`, but NaN is TRUTHY, so
+    NaN sailed through the `== 0` guard, turned that contract's GEX into NaN, and
+    poisoned the whole cumulative sum — every comparison against NaN is False, so
+    find_flip() silently fell through to its fallback and returned an arbitrary
+    strike. Anything not finite is treated as missing.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
+
+def _t_years(dte, now_et):
+    """Time to expiry in years.
+
+    0DTE is NOT a full day. Pricing it as one understates its gamma and, because
+    gex_all blends every expiry together, mis-weights the front expiry against
+    the back months. For 0DTE use the fraction of today's RTH session that is
+    actually left (floored so gamma stays finite after the close).
+    """
+    if dte > 0:
+        return dte / 365.0
+    close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    secs_left = (close - now_et).total_seconds()
+    if secs_left <= 0:
+        return 0.5 / TRADING_HOURS_PER_YEAR      # after the close: a token 30 min
+    return max(secs_left / 3600.0, 0.1) / TRADING_HOURS_PER_YEAR
+
+def _atm_iv(chain, spot, lo, hi):
+    """One representative implied vol for an expiry.
+
+    Median of the implied vols on the ATM_IV_STRIKES strikes nearest spot, taken
+    across calls and puts. Median rather than mean so a single junk quote cannot
+    drag the reference — which is the whole point, since a junk quote on one
+    strike is exactly what was moving the wall.
+
+    Returns None when the expiry has no usable vol, in which case the caller
+    falls back to that contract's own IV.
+    """
+    rows = []
+    for frame in (chain.calls, chain.puts):
+        for _, r in frame.iterrows():
+            K = _num(r["strike"], -1.0)
+            if K < lo or K > hi:
+                continue
+            iv = _num(r["impliedVolatility"])
+            # Placeholder vols must be excluded BEFORE the median, not trimmed
+            # after it — pre-market they are the majority, so they would carry
+            # the median rather than sit in its tail.
+            if iv >= IV_MIN_PLAUSIBLE:
+                rows.append((abs(K - spot), iv))
+    if not rows:
+        return None
+    rows.sort(key=lambda t: t[0])
+    near = [iv for _, iv in rows[:max(1, ATM_IV_STRIKES * 2)]]
+    near.sort()
+    n = len(near)
+    return near[n // 2] if n % 2 else 0.5 * (near[n // 2 - 1] + near[n // 2])
+
+
+def _bucket():
+    # Puts are accumulated as a POSITIVE magnitude and subtracted into `net`, so
+    # a put wall can be found on put gamma alone rather than on a net figure that
+    # heavy call OI at the same strike can cancel out.
+    return {"call": 0.0, "put": 0.0, "net": 0.0}
+
 def compute_gex(ref_spot_dia=None):
     """
     ref_spot_dia : reliable DIA-equivalent spot derived from the YM futures
                    price (ym_price / DIA_TO_YM). Used to (a) override a stale
                    dia.history() close and (b) filter option strikes near spot.
 
-    Returns spot, gex_all, gex_0dte, has_true_0dte, spot_was_corrected.
+    Returns spot, gex_all, gex_0dte, has_true_0dte, spot_was_corrected, diag.
+
+    `diag` counts what the option feed actually delivered so an empty gamma
+    section can name its own cause instead of just printing nothing.
     """
+    diag = {"strikes_in_band": 0, "contracts_with_oi": 0,
+            "contracts_with_iv": 0, "total_oi": 0.0, "expiries_used": 0,
+            "contracts_placeholder_iv": 0, "atm_iv": {}}
     dia = yf.Ticker("DIA")
     spot = float(dia.history(period="1d")["Close"].iloc[-1])
 
@@ -175,7 +334,8 @@ def compute_gex(ref_spot_dia=None):
     all_exp = dia.options
     gex_all = {}
     gex_0dte = {}
-    today_d = date.today()
+    now_et = datetime.now(ET)
+    today_d = now_et.date()
 
     parsed = []
     for exp in all_exp:
@@ -187,78 +347,214 @@ def compute_gex(ref_spot_dia=None):
         if 0 <= dte <= MAX_DTE:
             parsed.append((exp, dte))
     if not parsed:
-        return spot, gex_all, gex_0dte, False, spot_was_corrected
+        return spot, gex_all, gex_0dte, False, spot_was_corrected, diag
 
     parsed.sort(key=lambda x: x[1])
     front_exp = parsed[0][0]
     has_true_0dte = (parsed[0][1] == 0)
 
     for exp, dte in parsed:
-        T = max(dte, 1) / 365.0
+        T = _t_years(dte, now_et)
         try:
             chain = dia.option_chain(exp)
         except Exception:
             continue
 
+        diag["expiries_used"] += 1
         is_front = (exp == front_exp)
-        for _, row in chain.calls.iterrows():
-            K = row["strike"]
-            if K < lo or K > hi:              # strike-band filter
-                continue
-            oi = row["openInterest"] or 0
-            iv = row["impliedVolatility"] or 0
-            if oi == 0 or iv == 0:
-                continue
-            g = bs_gamma(spot, K, T, RISK_FREE, iv)
-            gex = g * oi * CONTRACT_SIZE * spot * spot * 0.01
-            gex_all[K] = gex_all.get(K, 0) + gex
-            if is_front:
-                gex_0dte[K] = gex_0dte.get(K, 0) + gex
+        ref_iv = _atm_iv(chain, spot, lo, hi) if USE_ATM_IV else None
+        if ref_iv:
+            diag["atm_iv"][exp] = ref_iv
 
-        for _, row in chain.puts.iterrows():
-            K = row["strike"]
-            if K < lo or K > hi:              # strike-band filter
-                continue
-            oi = row["openInterest"] or 0
-            iv = row["impliedVolatility"] or 0
-            if oi == 0 or iv == 0:
-                continue
-            g = bs_gamma(spot, K, T, RISK_FREE, iv)
-            gex = g * oi * CONTRACT_SIZE * spot * spot * 0.01
-            gex_all[K] = gex_all.get(K, 0) - gex
-            if is_front:
-                gex_0dte[K] = gex_0dte.get(K, 0) - gex
+        for side, frame in (("call", chain.calls), ("put", chain.puts)):
+            for _, row in frame.iterrows():
+                K = _num(row["strike"], -1.0)
+                if K < lo or K > hi:              # strike-band filter
+                    continue
+                diag["strikes_in_band"] += 1
+                oi = _num(row["openInterest"])
+                iv = _num(row["impliedVolatility"])
+                if oi > 0:
+                    diag["contracts_with_oi"] += 1
+                    diag["total_oi"] += oi
+                if iv > 0:
+                    diag["contracts_with_iv"] += 1
+                if 0 < iv < IV_MIN_PLAUSIBLE:
+                    diag["contracts_placeholder_iv"] += 1
+                # An unpriced contract contributes nothing but noise. Without
+                # this it contributes a gamma that has underflowed to zero,
+                # which silently removes the strike from wall contention.
+                if oi <= 0 or iv < IV_MIN_PLAUSIBLE:
+                    continue
+                # Price off the expiry's ATM vol, not this contract's own, so a
+                # jittery per-strike quote cannot reorder the wall ranking. The
+                # contract still has to HAVE a vol to qualify above — a strike
+                # yfinance never priced is not one we want to weight.
+                g = bs_gamma(spot, K, T, RISK_FREE, ref_iv if ref_iv else iv)
+                gex = g * oi * CONTRACT_SIZE * spot * spot * 0.01
+                if not math.isfinite(gex):
+                    continue
 
-    return spot, gex_all, gex_0dte, has_true_0dte, spot_was_corrected
+                b = gex_all.setdefault(K, _bucket())
+                b[side] += gex
+                b["net"] += gex if side == "call" else -gex
+                if is_front:
+                    b0 = gex_0dte.setdefault(K, _bucket())
+                    b0[side] += gex
+                    b0["net"] += gex if side == "call" else -gex
 
-def find_flip(gex_dict):
-    strikes = sorted(gex_dict.keys())
+    return spot, gex_all, gex_0dte, has_true_0dte, spot_was_corrected, diag
+
+def find_flip(book, spot=None):
+    """Strike where net dealer gamma changes sign, interpolated, nearest spot.
+
+    Crossings are taken on each strike's OWN net gamma, not on a running
+    cumulative sum. The cumulative version cannot work here: strikes are already
+    truncated to +/-STRIKE_BAND of spot, so the running total starts from an
+    arbitrary zero at the bottom edge of the band. Measured live on 2026-08-20
+    that produced exactly ONE crossing, at 502.92 -- the band edge, 2,548 YM
+    points below the market -- which the sanity guard then dropped every time.
+
+    Worse, it was self-contradictory: cumulative net gamma at spot was about
+    -300M (short gamma), yet a flip *below* spot reads as "positive gamma". The
+    per-strike form has no such dependence on where the band begins, and is what
+    gex-dashboard's gex_calculator.find_zero_gamma() uses.
+
+    Many strikes flip sign, so nearest-to-spot selection is what keeps a
+    deep-OTM crossing on stale open interest from being returned.
+    """
+    strikes = sorted(book.keys())
     if not strikes:
         return None
-    cum, prev_K, prev_c = 0, None, 0
-    running = []
-    for K in strikes:
-        cum += gex_dict[K]
-        running.append((K, cum))
-        if prev_K is not None:
-            if (prev_c <= 0 and cum > 0) or (prev_c >= 0 and cum < 0):
-                if cum != prev_c:
-                    frac = -prev_c / (cum - prev_c)
-                    return prev_K + frac * (K - prev_K)
-        prev_K, prev_c = K, cum
-    return min(running, key=lambda kc: abs(kc[1]))[0]
+    if len(strikes) < 2:
+        return float(strikes[0])
 
-def find_walls(gex_dict, spot):
-    calls = {k: v for k, v in gex_dict.items() if v > 0 and k > spot}
-    puts = {k: v for k, v in gex_dict.items() if v < 0 and k < spot}
-    cw = max(calls, key=calls.get) if calls else None
-    pw = min(puts, key=puts.get) if puts else None
+    crossings = []
+    for i in range(len(strikes) - 1):
+        k0, k1 = strikes[i], strikes[i + 1]
+        n0, n1 = book[k0]["net"], book[k1]["net"]
+        if (n0 >= 0 > n1) or (n0 < 0 <= n1):
+            crossings.append(k0 + (k1 - k0) * (-n0 / (n1 - n0)) if n1 != n0 else float(k0))
+
+    if crossings:
+        ref = spot if spot else crossings[0]
+        return min(crossings, key=lambda x: abs(x - ref))
+    # No sign change anywhere: fall back to the strike closest to zero net.
+    return float(min(strikes, key=lambda k: abs(book[k]["net"])))
+
+def find_walls(book, spot):
+    """Call wall = most call gamma above spot; put wall = most put gamma below.
+
+    Measured on each side's OWN gamma, not on the net. On a net basis a strike
+    carrying both heavy calls and heavy puts nets toward zero and drops out of
+    the running entirely, so the wall lands on some thinner strike or vanishes.
+    """
+    above = {k: v["call"] for k, v in book.items() if k > spot and v["call"] > 0}
+    below = {k: v["put"] for k, v in book.items() if k < spot and v["put"] > 0}
+    cw = max(above, key=above.get) if above else None
+    pw = max(below, key=below.get) if below else None
     return cw, pw
+
+def wall_ladder(book, spot, side, depth=WALL_LADDER_DEPTH):
+    """The top `depth` strikes by that side's own gamma, ranked, strongest first.
+
+    Returns [(strike, gamma, share_of_leader), ...]. Rank 1 is the wall the old
+    single-argmax reported; publishing the runners-up alongside it is what makes
+    a near-tie visible instead of showing up as a level that teleports between
+    two strikes on consecutive runs.
+    """
+    if side == "call":
+        cand = {k: v["call"] for k, v in book.items() if k > spot and v["call"] > 0}
+    else:
+        cand = {k: v["put"] for k, v in book.items() if k < spot and v["put"] > 0}
+    if not cand:
+        return []
+    ranked = sorted(cand.items(), key=lambda kv: kv[1], reverse=True)[:max(1, depth)]
+    lead = ranked[0][1]
+    return [(k, g, (g / lead if lead > 0 else 0.0)) for k, g in ranked]
+
+
+def wall_contest(book, spot, side, threshold=WALL_CONTEST_FRAC):
+    """Is the winning wall strike actually a clear winner?
+
+    The wall is an argmax, so two strikes carrying similar gamma trade places on
+    any small IV or spot drift and the printed level teleports by the distance
+    between them. Observed live on 2026-08-20: K525 at 70.2M vs K527 at 61.5M —
+    only 12% apart but 200 YM points apart — and the put wall oscillated between
+    the two across consecutive 5-minute runs.
+
+    Returns (leader, rival, rival_share) when the runner-up is within `threshold`
+    of the leader, else None. The level itself is deliberately NOT changed; this
+    only reports that it is contested.
+    """
+    if side == "call":
+        cand = {k: v["call"] for k, v in book.items() if k > spot and v["call"] > 0}
+    else:
+        cand = {k: v["put"] for k, v in book.items() if k < spot and v["put"] > 0}
+    if len(cand) < 2:
+        return None
+    ranked = sorted(cand.items(), key=lambda kv: kv[1], reverse=True)
+    (k1, g1), (k2, g2) = ranked[0], ranked[1]
+    if g1 <= 0:
+        return None
+    share = g2 / g1
+    return (k1, k2, share) if share >= (1.0 - threshold) else None
 
 def sane_level(val_ym, spot_ym):
     if val_ym is None:
         return False
-    return abs(val_ym - spot_ym) <= GAMMA_SANITY_PTS
+    return abs(val_ym - spot_ym) <= GAMMA_SANITY_FRAC * spot_ym
+
+# ==========================================================
+#   WALL FREEZE — walls are a once-a-day number, flips are not
+# ==========================================================
+# A wall is an open-interest concentration, and OI is published overnight by the
+# OCC and cannot change during the session. Re-deriving it every few minutes and
+# weighting it by Black-Scholes gamma at live spot injects a spot-dependence into
+# something that is static by nature, which is what makes the printed level step
+# around during the day. So the walls are computed ONCE and held for the session,
+# the way MenthorQ's getDailyLevels does it.
+#
+# The flip and the regime are deliberately NOT frozen. Their entire content is
+# where price sits relative to the gamma profile *right now*; freezing them would
+# throw away the only genuinely intraday-useful part of this.
+#
+# Note this stores the final YM-converted prices, not DIA strikes. Freezing the
+# strike and re-converting each run would let the DIA->YM ratio drift move the
+# level, defeating the point.
+def _freeze_path():
+    return os.path.join(OUTPUT_DIR, "ym_walls_frozen.json")
+
+
+def load_frozen_walls(day):
+    """Today's frozen walls, or None if absent/stale/unreadable."""
+    try:
+        with open(_freeze_path(), encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if d.get("date") != day or not d.get("walls"):
+        return None
+    return d
+
+
+def save_frozen_walls(day, walls, contested, ladder, ym_price, dia_spot):
+    payload = {
+        "date": day,
+        "frozen_at": datetime.now(ET).strftime("%H:%M:%S"),
+        "ym_price": round(ym_price),
+        "dia_spot": round(dia_spot, 2),
+        "walls": walls,
+        "contested": contested or {},
+        "ladder": ladder or {},
+    }
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    tmp = _freeze_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, _freeze_path())
+    return payload
+
 
 # ==========================================================
 #   PART 3 — CONFLUENCE DETECTOR
@@ -286,12 +582,19 @@ def find_confluences(levels, tol=CONFLUENCE_TOL):
 # ==========================================================
 #   PART 4 — CSV EXPORT FOR NINJATRADER
 # ==========================================================
-def export_csv(pivots, on, pw, pm, gamma_levels, regime, dia_spot, ym_price):
-    csv_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "ym_levels.csv"
-    )
-    with open(csv_path, "w", newline="") as f:
+def export_csv(pivots, on, pw, pm, gamma_levels, regime, dia_spot, ym_price,
+               contested=None, ladder=None):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    csv_path = os.path.join(OUTPUT_DIR, "ym_levels.csv")
+
+    # Write to a temp file in the same folder and os.replace() it into place.
+    # NinjaTrader polls this file on a timer and reloads it the moment the mtime
+    # changes, so it CAN catch a half-written file — and since YMLevels now
+    # erases the line of any level missing from a reload, a truncated read would
+    # wipe levels off the chart rather than merely leave them stale. os.replace
+    # is atomic on Windows, so a reader sees either the old file or the new one.
+    tmp_path = csv_path + ".tmp"
+    with open(tmp_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["Name", "Price", "Type", "Color"])
 
@@ -338,12 +641,100 @@ def export_csv(pivots, on, pw, pm, gamma_levels, regime, dia_spot, ym_price):
                          datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
                          "Meta", "White"])
 
+        # Contested walls ride as Meta rows: every NinjaScript reader skips
+        # Type == "Meta", so these never draw a line or affect the strategy --
+        # they are here so the CSV records that a wall was a coin toss.
+        for label, rival_px in (contested or {}).items():
+            writer.writerow([label.replace(" ", "") + "Rival", rival_px,
+                             "Meta", "White"])
+
+        # The wall ladder, recorded but NOT published as levels. Ranks 2+ used to
+        # go out as Gamma rows, which made them things the room filter measured
+        # against; as Meta they are skipped by every NinjaScript reader. Kept so
+        # the "was dropping the ladder good or bad" question can be answered
+        # later from the archive -- it needs to know where these ranks WERE.
+        for side, pretty in (("call", "Call"), ("put", "Put")):
+            for rank, (px, share) in enumerate((ladder or {}).get(side, []), start=1):
+                if rank <= WALL_LADDER_DEPTH:
+                    continue          # already published under its own name
+                writer.writerow([f"Rank{rank}{pretty}", px, "Meta", "White"])
+                writer.writerow([f"Rank{rank}{pretty}Pct", round(share * 100),
+                                 "Meta", "White"])
+
+    os.replace(tmp_path, csv_path)
+    archive_levels(csv_path)
     return csv_path
+
+
+def archive_levels(csv_path):
+    """Keep a timestamped copy of every distinct level set.
+
+    ym_levels.csv is overwritten on each run, so there is no history of what the
+    levels actually WERE at any past moment. That makes the strategy's room
+    filter (SRMinRoomTicks against the nearest level) impossible to back-test --
+    and in live observation that filter rejected 8 of 10 signals, so it is the
+    largest unmeasured factor in the whole setup.
+
+    Archiving per RUN rather than per day on purpose: the walls are pinned for
+    the session but the flip and regime keep updating, so the level set a signal
+    was actually judged against changes through the day.
+
+    Skips a write when the level set is unchanged, comparing everything except
+    the Updated stamp -- otherwise a re-run a minute later stores a near-duplicate.
+    """
+    try:
+        arch = os.path.join(OUTPUT_DIR, "archive")
+        os.makedirs(arch, exist_ok=True)
+
+        with open(csv_path, encoding="utf-8") as f:
+            body = f.read()
+
+        def significant(text):
+            """What has to change before a new archive is worth keeping.
+
+            Compare the LEVELS plus Regime, and nothing else. Excluding only the
+            Updated row was not enough: YM_Price and DIA_Spot are Meta rows that
+            move every single run, so dedupe would never have fired and this
+            would have stored a near-identical file every 15 minutes.
+
+            Keying on levels+regime gives a compact and still-correct history:
+            to reconstruct what the filter saw at time T, take the most recent
+            archive at or before T. That is exact as long as a file is written
+            whenever the level set changes, which is what this tests.
+            """
+            keep = []
+            for ln in text.splitlines():
+                p = ln.split(",")
+                if len(p) < 3 or not ln.strip():
+                    continue
+                if p[2].strip() == "Meta":
+                    if p[0].strip() == "Regime":
+                        keep.append(ln)          # a regime flip IS a change
+                    continue                      # prices/timestamps are context
+                keep.append(ln)
+            return keep
+
+        prior = sorted(glob.glob(os.path.join(arch, "ym_levels_*.csv")))
+        if prior:
+            with open(prior[-1], encoding="utf-8") as f:
+                if significant(f.read()) == significant(body):
+                    return None          # nothing changed since the last archive
+
+        stamp = datetime.now(ET).strftime("%Y%m%d_%H%M%S")
+        dst = os.path.join(arch, f"ym_levels_{stamp}.csv")
+        with open(dst, "w", encoding="utf-8", newline="") as f:
+            f.write(body)
+        print(f"  archived level set -> archive/{os.path.basename(dst)}")
+        return dst
+    except Exception as e:
+        # Archiving is for research; never let it break the run that feeds the chart.
+        print(f"  (archive skipped: {type(e).__name__}: {e})")
+        return None
 
 # ==========================================================
 #   MAIN
 # ==========================================================
-def main():
+def main(refreeze=False):
     now_et = datetime.now(ET)
     today = now_et.date()
 
@@ -358,7 +749,14 @@ def main():
     intra, ym_price = fetch_ym_intraday()
     print(f"  Current YM: {ym_price:.0f}")
 
-    yesterday = daily[-2]
+    # Pivots must come from the last COMPLETED session. daily[-2] assumed Yahoo had
+    # already emitted a partial bar for today; run pre-market before that bar exists
+    # and daily[-2] is the day before yesterday, silently shifting every pivot by a
+    # session. Select by date instead of by position.
+    prior_sessions = [b for b in daily if b["dt"].date() < today]
+    if not prior_sessions:
+        raise RuntimeError("No completed YM daily session found in the Yahoo history")
+    yesterday = prior_sessions[-1]
     pivots = compute_pivots(yesterday)
     on = compute_overnight(intra, today)
     pw, pw_start, pw_end = compute_prior_week(daily, today)
@@ -366,17 +764,26 @@ def main():
 
     # ---- Gamma ----
     print("\n[2/4] Fetching DIA options chain (may take 20-40s)...")
-    ref_dia = ym_price / DIA_TO_YM          # reliable DIA-equivalent from futures
-    dia_spot, gex_all, gex_0dte, has_true_0dte, corrected = compute_gex(ref_dia)
+    ref_dia = ym_price / DIA_TO_YM          # rough seed, only to filter strikes
+    dia_spot, gex_all, gex_0dte, has_true_0dte, corrected, gdiag = compute_gex(ref_dia)
 
     # Anchor sanity + regime to the FUTURES price, which we trust.
     spot_ym = ym_price
 
-    flip_full = find_flip(gex_all)
-    flip_0dte = find_flip(gex_0dte)
+    # LIVE DIA->YM ratio. The fixed 100 multiplier is wrong — the true ratio
+    # drifts (dividends, tracking error, futures basis). Using ym_price/dia_spot
+    # lands every gamma level correctly instead of hundreds of points off.
+    if dia_spot and dia_spot > 0:
+        dia_to_ym = ym_price / dia_spot
+    else:
+        dia_to_ym = DIA_TO_YM               # fallback if DIA spot unavailable
+
+    flip_full = find_flip(gex_all, dia_spot)
+    flip_0dte = find_flip(gex_0dte, dia_spot)
     cw_full, pw_full_wall = find_walls(gex_all, dia_spot)
     cw_0dte, pw_0dte = find_walls(gex_0dte, dia_spot)
-    print(f"  DIA spot: {dia_spot:.2f}  ({round(dia_spot * DIA_TO_YM)} YM equiv)"
+    print(f"  DIA spot: {dia_spot:.2f}  (live ratio {dia_to_ym:.2f}, "
+          f"{round(dia_spot * dia_to_ym)} YM equiv)"
           + ("  [corrected from stale DIA close]" if corrected else ""))
     if not has_true_0dte:
         print("  NOTE: no true 0DTE expiry today; 'Flip 0DTE' uses nearest expiry.")
@@ -404,15 +811,16 @@ def main():
     print(f"\n--- Gamma Levels (from DIA options) ---")
     gamma_levels = {}
 
-    def add_gamma(name, dia_val):
+    def add_gamma(name, dia_val, note=""):
         if dia_val is None:
             return
-        v = round(dia_val * DIA_TO_YM)
+        v = round(dia_val * dia_to_ym)
         if not sane_level(v, spot_ym):
-            print(f"  {name:<15} {v}  [DROPPED: >{GAMMA_SANITY_PTS} pts from spot {spot_ym}]")
+            guard = round(GAMMA_SANITY_FRAC * spot_ym)
+            print(f"  {name:<17} {v}  [DROPPED: >{guard} pts from spot {spot_ym}]")
             return
         gamma_levels[name] = v
-        print(f"  {name:<15} {v}")
+        print(f"  {name:<17} {v}" + (f"   {note}" if note else ""))
 
     add_gamma("Gamma Flip", flip_full)
     add_gamma("Flip 0DTE", flip_0dte)
@@ -421,24 +829,158 @@ def main():
     add_gamma("Put Wall", pw_full_wall)
     add_gamma("Put Wall 0DTE", pw_0dte)
 
-    # ---- Regime: gamma flip first, else PIVOT FALLBACK ----
-    regime_flip = None
-    if "Gamma Flip" in gamma_levels:
-        regime_flip = gamma_levels["Gamma Flip"]
-    elif "Flip 0DTE" in gamma_levels:
-        regime_flip = gamma_levels["Flip 0DTE"]
+    # Ranks 2..N of each wall. Rank 1 is already published above under its plain
+    # name, so start at 2 and never re-emit the leader.
+    ladder_rec = {}
+    if gex_all:
+        for side, label in (("call", "Call Wall"), ("put", "Put Wall")):
+            ladder = wall_ladder(gex_all, dia_spot, side)
+            for rank, (K, _g, share) in enumerate(ladder[1:], start=2):
+                add_gamma(f"{label} {rank}", K, note=f"{share:.0%} of rank 1")
+            # Record deeper than we publish. These go out as Meta rows, so they
+            # are analysis data rather than levels anything trades against.
+            full = wall_ladder(gex_all, dia_spot, side, depth=WALL_LADDER_RECORD_DEPTH)
+            ladder_rec[side] = [(round(K * dia_to_ym), round(share, 3))
+                                for K, _g, share in full]
 
-    if regime_flip is not None:
-        regime = "POSITIVE" if spot_ym > regime_flip else "NEGATIVE"
+    # Every gamma number is gamma x OPEN INTEREST. If the feed hands back no open
+    # interest there is nothing to compute, and an empty section on its own looks
+    # identical to "no levels qualified". Say which one it was.
+    if not gamma_levels:
+        print("  (none)")
+        if gdiag["contracts_with_oi"] == 0:
+            print()
+            print(f"  GAMMA UNAVAILABLE - the options feed returned NO open interest.")
+            print(f"    {gdiag['strikes_in_band']} contracts in the +/-{STRIKE_BAND:.0%} "
+                  f"strike band across {gdiag['expiries_used']} expiries,")
+            print(f"    {gdiag['contracts_with_iv']} had an implied vol, but 0 had open interest.")
+            print( "    GEX = gamma x OI, so with no OI there is nothing to compute.")
+            print( "    This is a DATA problem, not a settings problem. Regime falls back to the pivot.")
+        else:
+            print(f"\n  All gamma levels failed the {GAMMA_SANITY_FRAC:.0%}-from-spot sanity guard.")
+            print(f"    ({gdiag['contracts_with_oi']} contracts had OI, total {int(gdiag['total_oi']):,})")
+
+    # ---- Regime: SIGN OF TOTAL NET GAMMA, else PIVOT FALLBACK ----
+    #
+    # This used to be `spot > flip ? POSITIVE : NEGATIVE`. That is unusable here.
+    # With ~12 net-gamma sign changes inside the strike band and DIA strikes $1
+    # apart (~100 YM points), the nearest crossing to spot is essentially always
+    # on the same side of price: over 17 consecutive live runs on 2026-08-20 the
+    # flip came in between +67 and +145 YM points ABOVE spot every single time,
+    # so the regime printed NEGATIVE 17/17 no matter what the market did. It was
+    # a constant, not a reading.
+    #
+    # Summed net GEX is the quantity the regime is actually asking about — are
+    # dealers net long or net short gamma — and it is already computed. It gave
+    # the same answer that day (-350.9M => NEGATIVE) by a route that can change.
+    net_total = sum(v["net"] for v in gex_all.values()) if gex_all else 0.0
+
+    if gex_all and net_total != 0:
+        regime = "POSITIVE" if net_total > 0 else "NEGATIVE"
         tag = "stable/mean-revert" if regime == "POSITIVE" else "volatile/trending"
-        print(f"\n  Regime: {regime} ({tag})   [gamma flip {regime_flip}]")
+        print(f"\n  Regime: {regime} ({tag})   [net GEX {net_total:,.0f}]")
     else:
         # No usable gamma flip today (thin/bad options). Fall back to structure:
         # price vs the daily Pivot. Keeps NinjaTrader stat buckets resolving.
         pvt = pivots["Pivot"]
         regime = "POSITIVE" if ym_price > pvt else "NEGATIVE"
-        print(f"\n  Regime: {regime}   [PIVOT FALLBACK - no valid gamma flip; "
+        print(f"\n  Regime: {regime}   [PIVOT FALLBACK - no gamma data at all; "
               f"price {round(ym_price)} vs Pivot {pvt}]")
+
+    # ---- Is either wall a clear winner, or a coin toss between two strikes? ----
+    contested = {}
+    for side, label in (("call", "Call Wall"), ("put", "Put Wall")):
+        c = wall_contest(gex_all, dia_spot, side)
+        if not c:
+            continue
+        leader, rival, share = c
+        contested[label] = round(rival * dia_to_ym)
+        print(f"\n  ! {label} is CONTESTED: {round(leader * dia_to_ym)} leads, but "
+              f"{round(rival * dia_to_ym)} carries {share:.0%} of its gamma.")
+        print(f"    They swap on small IV/spot drift, moving the level "
+              f"{abs(round((leader - rival) * dia_to_ym))} pts. Treat it as a zone.")
+
+    # ---- Walls hold for the session; flip and regime stay live ----
+    # A book is only credible if a decent share of its strikes actually carry
+    # gamma. When implied vol is unpublished the gamma underflows to zero and the
+    # book collapses onto a handful of strikes, which still yields a wall — just
+    # a meaningless one. Measured on the bad 2026-08-21 pre-market run: 11 of 62
+    # strikes. A healthy RTH book had all 62.
+    strikes_with_gamma = sum(1 for v in gex_all.values() if v["call"] or v["put"])
+    book_ok = bool(gex_all) and strikes_with_gamma >= max(8, len(gex_all) // 3)
+    if gex_all and not book_ok:
+        print(f"\n  ! Gamma book looks degenerate: only {strikes_with_gamma} of "
+              f"{len(gex_all)} strikes carry any gamma.")
+        print( "    Implied vol is probably not published yet. Walls will NOT be pinned.")
+
+    # Never pin before the open. Pre-market the chain is not properly priced on
+    # EITHER input: open interest is absent overnight, and the implied vols that
+    # do appear are far too low — measured 2026-08-21 at 09:11 ET the ATM vols
+    # came out at 0.031 / 0.016 / 0.008 against 0.096-0.128 in the prior RTH
+    # session, with the term structure inverted. Those clear the placeholder
+    # floor but are not real vols, so a pre-market pin would fix a distorted
+    # reading in place for the entire day. Pre-market runs still publish live
+    # provisional walls; they just do not become the day's pin.
+    rth_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    in_rth = now_et >= rth_open
+
+    # Wall-clock is necessary but not sufficient -- the feed lags the bell. Also
+    # require the chain to have actually repriced.
+    ivs = sorted(gdiag["atm_iv"].values()) if gdiag.get("atm_iv") else []
+    med_iv = ivs[len(ivs) // 2] if ivs else 0.0
+    iv_is_live = med_iv >= ATM_IV_MIN_FOR_PIN
+    gamma_is_credible = book_ok and in_rth and iv_is_live
+    if book_ok and in_rth and not iv_is_live:
+        print(f"\n  Chain has not repriced yet — median ATM vol {med_iv:.3f} is under "
+              f"{ATM_IV_MIN_FOR_PIN:.3f}. Walls NOT pinned.")
+        print( "    (pre-open vols run 0.008-0.031, RTH 0.096-0.129; the feed lags the bell)")
+    if book_ok and not in_rth:
+        mins = int((rth_open - now_et).total_seconds() // 60)
+        print(f"\n  Pre-market: walls shown are PROVISIONAL and are not pinned "
+              f"({mins} min to the open).")
+        print( "    The chain is not fully priced yet. Re-run after 09:30 ET to set the day's walls.")
+
+    day = today.isoformat()
+    flip_levels = {k: v for k, v in gamma_levels.items() if "Flip" in k}
+    wall_levels = {k: v for k, v in gamma_levels.items() if "Wall" in k}
+
+    frozen = None if refreeze else load_frozen_walls(day)
+    if frozen:
+        live_walls = wall_levels
+        wall_levels = frozen["walls"]
+        contested = frozen.get("contested", {})
+        ladder_rec = frozen.get("ladder", ladder_rec)
+        print(f"\n  Walls HELD from {frozen['frozen_at']} ET (YM was {frozen['ym_price']}) "
+              f"- {len(wall_levels)} levels reused, not recomputed.")
+        print( "    Flip and regime above are live. Re-run with --refreeze to redo the walls.")
+        # The Gamma Levels block above printed what the CURRENT chain says. Those
+        # are not what goes to the CSV once the walls are held, so show the held
+        # values and how far the live book has drifted from them.
+        drift = [(n, wall_levels[n], live_walls[n])
+                 for n in wall_levels if n in live_walls and live_walls[n] != wall_levels[n]]
+        print("    held:  " + "  ".join(f"{n} {p}" for n, p in sorted(wall_levels.items())))
+        if drift:
+            print("    live would now say: "
+                  + "  ".join(f"{n} {lv} ({lv - hp:+d})" for n, hp, lv in sorted(drift)))
+        else:
+            print("    (the live book still agrees with every held level)")
+    elif wall_levels and gamma_is_credible:
+        # Only ever pin a reading that actually has gamma behind it. Non-empty is
+        # NOT sufficient: pre-market, unpriced contracts still carry open
+        # interest, so walls get produced from a book where gamma has underflowed
+        # on nearly every strike. On 2026-08-21 that pinned a put wall one point
+        # below spot and a regime of POSITIVE, against NEGATIVE the day before.
+        # A pin is for the whole session, so it has to clear a real bar.
+        f = save_frozen_walls(day, wall_levels, contested, ladder_rec, ym_price, dia_spot)
+        print(f"\n  Walls FROZEN for {day} at {f['frozen_at']} ET - {len(wall_levels)} levels.")
+        print( "    Later runs today reuse these; flip and regime keep updating.")
+    elif not wall_levels:
+        print("\n  No walls to pin - no gamma data this run.")
+    # The remaining case (walls exist but were not pinned, because the book is
+    # degenerate or it is still pre-market) has already explained itself above.
+
+    gamma_levels = dict(flip_levels)
+    gamma_levels.update(wall_levels)
 
     # ---- Confluence ----
     print(f"\n[3/4] Scanning for confluences (within {CONFLUENCE_TOL} pts)...")
@@ -473,7 +1015,7 @@ def main():
     # ---- CSV Export ----
     print(f"\n[4/4] Exporting to CSV for NinjaTrader...")
     csv_path = export_csv(pivots, on, pw, pm, gamma_levels,
-                          regime, dia_spot, ym_price)
+                          regime, dia_spot, ym_price, contested, ladder_rec)
     print(f"  Levels exported to: {csv_path}")
 
     print("\n" + "=" * 60)
@@ -482,4 +1024,34 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    _ap = argparse.ArgumentParser(description="YM full level sheet")
+    _ap.add_argument("--refreeze", action="store_true",
+                     help="recompute today's walls and re-pin them, discarding the "
+                          "existing freeze (use if the morning run caught bad data)")
+    _args, _ = _ap.parse_known_args()
+
+    # Friendly runner for non-technical users running the packaged .exe:
+    # never crash-and-vanish. On any failure, show a plain-English message and
+    # keep the window open so it can be read.
+    try:
+        main(refreeze=_args.refreeze)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+    except Exception as e:
+        print("\n" + "=" * 60)
+        print("  SOMETHING WENT WRONG")
+        print("=" * 60)
+        print(f"  {type(e).__name__}: {e}")
+        print()
+        print("  Common causes:")
+        print("   - No internet connection, or Yahoo Finance is unreachable")
+        print("   - The market data feed is temporarily down or rate-limited")
+        print("   - Options data was empty/unavailable for DIA this morning")
+        print()
+        print("  Try again in a few minutes. If it keeps failing, check your")
+        print("  internet connection first.")
+        print("=" * 60)
+    try:
+        input("\nPress Enter to close...")
+    except EOFError:
+        pass
