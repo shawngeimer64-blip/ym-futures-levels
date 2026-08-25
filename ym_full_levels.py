@@ -31,6 +31,7 @@ FIXES IN THIS VERSION
 import argparse
 import requests
 import csv
+import glob
 import json
 import math
 import os
@@ -89,10 +90,37 @@ ATM_IV_STRIKES = 5      # median IV over this many strikes nearest spot, per sid
 # placeholder and the contract is treated as unpriced.
 IV_MIN_PLAUSIBLE = 0.005
 
+# Separate, higher bar for PINNING the day's walls. IV_MIN_PLAUSIBLE only rejects
+# Yahoo's 0.00001 placeholder; it does not reject a chain that simply has not
+# repriced yet. Measured: pre-open ATM vols come out at 0.008-0.031, RTH at
+# 0.096-0.129 -- a clean gap. A clock-only gate pinned at 09:30:08 on 2026-08-25,
+# eight seconds after the bell, when the feed was still serving the pre-open
+# chain. A pin lasts the whole session, so it has to wait for real data rather
+# than for a particular second.
+ATM_IV_MIN_FOR_PIN = 0.05
+
 # How many strikes to publish per side. Rank 1 is "Call Wall"/"Put Wall"; deeper
 # ranks are suffixed. A single argmax hides the fact that the top few strikes are
 # often near-tied, which is what made the printed wall look like it teleported.
-WALL_LADDER_DEPTH = 3
+# Set to 1 after live evidence. Publishing ranks 2-3 as ordinary Gamma rows made
+# them real drawn levels, which the STRATEGY's room filter then measures against
+# -- not just the star and LevelBreak mode as first assumed. Densifying the level
+# set left less clear space, and with SRMinRoomTicks=25 that cost entries: on
+# 2026-08-25, "Put Wall 2/3" and "Call Wall 2/3" accounted for 7 of 26 named
+# room blocks. The ladder's job was diagnostic -- showing that walls are often
+# near-tied -- and it did that; the contested warning and the *Rival meta rows
+# still report it without turning it into a level that blocks trades.
+# Raise this again only for analysis, not for a live chart.
+WALL_LADDER_DEPTH = 1
+
+# How many ranks to RECORD, as distinct from how many to publish as levels.
+# Depth 1 stops ranks 2-3 gating trades, but it also stopped them being written
+# down at all -- and the open question "was dropping the ladder good or bad?"
+# cannot be answered without knowing where those ranks WERE at each signal time.
+# Ranks 2+ are therefore still computed and stored, as Meta rows. Every
+# NinjaScript reader skips Type == "Meta", so they inform the analysis without
+# ever becoming a level the room filter measures against.
+WALL_LADDER_RECORD_DEPTH = 3
 
 # Where the NinjaTrader side looks. YMLevels, YMLevelsLogger and any strategy
 # reading the same file resolve it from NinjaTrader.Core.Globals.UserDataDir, which is
@@ -510,7 +538,7 @@ def load_frozen_walls(day):
     return d
 
 
-def save_frozen_walls(day, walls, contested, ym_price, dia_spot):
+def save_frozen_walls(day, walls, contested, ladder, ym_price, dia_spot):
     payload = {
         "date": day,
         "frozen_at": datetime.now(ET).strftime("%H:%M:%S"),
@@ -518,6 +546,7 @@ def save_frozen_walls(day, walls, contested, ym_price, dia_spot):
         "dia_spot": round(dia_spot, 2),
         "walls": walls,
         "contested": contested or {},
+        "ladder": ladder or {},
     }
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     tmp = _freeze_path() + ".tmp"
@@ -554,7 +583,7 @@ def find_confluences(levels, tol=CONFLUENCE_TOL):
 #   PART 4 — CSV EXPORT FOR NINJATRADER
 # ==========================================================
 def export_csv(pivots, on, pw, pm, gamma_levels, regime, dia_spot, ym_price,
-               contested=None):
+               contested=None, ladder=None):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     csv_path = os.path.join(OUTPUT_DIR, "ym_levels.csv")
 
@@ -619,8 +648,88 @@ def export_csv(pivots, on, pw, pm, gamma_levels, regime, dia_spot, ym_price,
             writer.writerow([label.replace(" ", "") + "Rival", rival_px,
                              "Meta", "White"])
 
+        # The wall ladder, recorded but NOT published as levels. Ranks 2+ used to
+        # go out as Gamma rows, which made them things the room filter measured
+        # against; as Meta they are skipped by every NinjaScript reader. Kept so
+        # the "was dropping the ladder good or bad" question can be answered
+        # later from the archive -- it needs to know where these ranks WERE.
+        for side, pretty in (("call", "Call"), ("put", "Put")):
+            for rank, (px, share) in enumerate((ladder or {}).get(side, []), start=1):
+                if rank <= WALL_LADDER_DEPTH:
+                    continue          # already published under its own name
+                writer.writerow([f"Rank{rank}{pretty}", px, "Meta", "White"])
+                writer.writerow([f"Rank{rank}{pretty}Pct", round(share * 100),
+                                 "Meta", "White"])
+
     os.replace(tmp_path, csv_path)
+    archive_levels(csv_path)
     return csv_path
+
+
+def archive_levels(csv_path):
+    """Keep a timestamped copy of every distinct level set.
+
+    ym_levels.csv is overwritten on each run, so there is no history of what the
+    levels actually WERE at any past moment. That makes the strategy's room
+    filter (SRMinRoomTicks against the nearest level) impossible to back-test --
+    and in live observation that filter rejected 8 of 10 signals, so it is the
+    largest unmeasured factor in the whole setup.
+
+    Archiving per RUN rather than per day on purpose: the walls are pinned for
+    the session but the flip and regime keep updating, so the level set a signal
+    was actually judged against changes through the day.
+
+    Skips a write when the level set is unchanged, comparing everything except
+    the Updated stamp -- otherwise a re-run a minute later stores a near-duplicate.
+    """
+    try:
+        arch = os.path.join(OUTPUT_DIR, "archive")
+        os.makedirs(arch, exist_ok=True)
+
+        with open(csv_path, encoding="utf-8") as f:
+            body = f.read()
+
+        def significant(text):
+            """What has to change before a new archive is worth keeping.
+
+            Compare the LEVELS plus Regime, and nothing else. Excluding only the
+            Updated row was not enough: YM_Price and DIA_Spot are Meta rows that
+            move every single run, so dedupe would never have fired and this
+            would have stored a near-identical file every 15 minutes.
+
+            Keying on levels+regime gives a compact and still-correct history:
+            to reconstruct what the filter saw at time T, take the most recent
+            archive at or before T. That is exact as long as a file is written
+            whenever the level set changes, which is what this tests.
+            """
+            keep = []
+            for ln in text.splitlines():
+                p = ln.split(",")
+                if len(p) < 3 or not ln.strip():
+                    continue
+                if p[2].strip() == "Meta":
+                    if p[0].strip() == "Regime":
+                        keep.append(ln)          # a regime flip IS a change
+                    continue                      # prices/timestamps are context
+                keep.append(ln)
+            return keep
+
+        prior = sorted(glob.glob(os.path.join(arch, "ym_levels_*.csv")))
+        if prior:
+            with open(prior[-1], encoding="utf-8") as f:
+                if significant(f.read()) == significant(body):
+                    return None          # nothing changed since the last archive
+
+        stamp = datetime.now(ET).strftime("%Y%m%d_%H%M%S")
+        dst = os.path.join(arch, f"ym_levels_{stamp}.csv")
+        with open(dst, "w", encoding="utf-8", newline="") as f:
+            f.write(body)
+        print(f"  archived level set -> archive/{os.path.basename(dst)}")
+        return dst
+    except Exception as e:
+        # Archiving is for research; never let it break the run that feeds the chart.
+        print(f"  (archive skipped: {type(e).__name__}: {e})")
+        return None
 
 # ==========================================================
 #   MAIN
@@ -722,11 +831,17 @@ def main(refreeze=False):
 
     # Ranks 2..N of each wall. Rank 1 is already published above under its plain
     # name, so start at 2 and never re-emit the leader.
+    ladder_rec = {}
     if gex_all:
         for side, label in (("call", "Call Wall"), ("put", "Put Wall")):
             ladder = wall_ladder(gex_all, dia_spot, side)
             for rank, (K, _g, share) in enumerate(ladder[1:], start=2):
                 add_gamma(f"{label} {rank}", K, note=f"{share:.0%} of rank 1")
+            # Record deeper than we publish. These go out as Meta rows, so they
+            # are analysis data rather than levels anything trades against.
+            full = wall_ladder(gex_all, dia_spot, side, depth=WALL_LADDER_RECORD_DEPTH)
+            ladder_rec[side] = [(round(K * dia_to_ym), round(share, 3))
+                                for K, _g, share in full]
 
     # Every gamma number is gamma x OPEN INTEREST. If the feed hands back no open
     # interest there is nothing to compute, and an empty section on its own looks
@@ -808,7 +923,17 @@ def main(refreeze=False):
     # provisional walls; they just do not become the day's pin.
     rth_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     in_rth = now_et >= rth_open
-    gamma_is_credible = book_ok and in_rth
+
+    # Wall-clock is necessary but not sufficient -- the feed lags the bell. Also
+    # require the chain to have actually repriced.
+    ivs = sorted(gdiag["atm_iv"].values()) if gdiag.get("atm_iv") else []
+    med_iv = ivs[len(ivs) // 2] if ivs else 0.0
+    iv_is_live = med_iv >= ATM_IV_MIN_FOR_PIN
+    gamma_is_credible = book_ok and in_rth and iv_is_live
+    if book_ok and in_rth and not iv_is_live:
+        print(f"\n  Chain has not repriced yet — median ATM vol {med_iv:.3f} is under "
+              f"{ATM_IV_MIN_FOR_PIN:.3f}. Walls NOT pinned.")
+        print( "    (pre-open vols run 0.008-0.031, RTH 0.096-0.129; the feed lags the bell)")
     if book_ok and not in_rth:
         mins = int((rth_open - now_et).total_seconds() // 60)
         print(f"\n  Pre-market: walls shown are PROVISIONAL and are not pinned "
@@ -824,6 +949,7 @@ def main(refreeze=False):
         live_walls = wall_levels
         wall_levels = frozen["walls"]
         contested = frozen.get("contested", {})
+        ladder_rec = frozen.get("ladder", ladder_rec)
         print(f"\n  Walls HELD from {frozen['frozen_at']} ET (YM was {frozen['ym_price']}) "
               f"- {len(wall_levels)} levels reused, not recomputed.")
         print( "    Flip and regime above are live. Re-run with --refreeze to redo the walls.")
@@ -845,7 +971,7 @@ def main(refreeze=False):
         # on nearly every strike. On 2026-08-21 that pinned a put wall one point
         # below spot and a regime of POSITIVE, against NEGATIVE the day before.
         # A pin is for the whole session, so it has to clear a real bar.
-        f = save_frozen_walls(day, wall_levels, contested, ym_price, dia_spot)
+        f = save_frozen_walls(day, wall_levels, contested, ladder_rec, ym_price, dia_spot)
         print(f"\n  Walls FROZEN for {day} at {f['frozen_at']} ET - {len(wall_levels)} levels.")
         print( "    Later runs today reuse these; flip and regime keep updating.")
     elif not wall_levels:
@@ -889,7 +1015,7 @@ def main(refreeze=False):
     # ---- CSV Export ----
     print(f"\n[4/4] Exporting to CSV for NinjaTrader...")
     csv_path = export_csv(pivots, on, pw, pm, gamma_levels,
-                          regime, dia_spot, ym_price, contested)
+                          regime, dia_spot, ym_price, contested, ladder_rec)
     print(f"  Levels exported to: {csv_path}")
 
     print("\n" + "=" * 60)
